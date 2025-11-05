@@ -11,7 +11,7 @@ import threading
 import asyncio
 
 # ========== CONFIGURATION ==========
-DISCORD_BOT_TOKEN = os.getenv('DISCORD_TOKEN')
+DISCORD_BOT_TOKEN = os.getenv('DISCORD_BOT_TOKEN')
 CODES_FILE = "redeem_codes.json"
 ORDERS_FILE = "orders.json"
 PAYMENT_TARGET = "number27"
