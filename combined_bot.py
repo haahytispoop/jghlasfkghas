@@ -25,6 +25,12 @@ GUILD_ID = 1417458795461869670
 PORT = int(os.getenv('PORT', 5000))
 RAILWAY_PUBLIC_URL = os.getenv('RAILWAY_STATIC_URL', f'http://localhost:{PORT}')
 
+# Fix URL scheme if missing
+if RAILWAY_PUBLIC_URL and not RAILWAY_PUBLIC_URL.startswith(('http://', 'https://')):
+    RAILWAY_PUBLIC_URL = f'https://{RAILWAY_PUBLIC_URL}'
+
+print(f"🌐 Public URL: {RAILWAY_PUBLIC_URL}")
+
 # Initialize Discord bot
 intents = discord.Intents.default()
 intents.message_content = True
