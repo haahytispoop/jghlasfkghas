@@ -10,16 +10,31 @@ from flask import Flask, request, jsonify
 import threading
 import asyncio
 
+print("🚀 Starting combined Discord bot and API server...")
+
 # ========== CONFIGURATION ==========
 DISCORD_BOT_TOKEN = os.getenv('DISCORD_BOT_TOKEN')
+
+# Debug: Check if token is set
+if not DISCORD_BOT_TOKEN:
+    print("❌ CRITICAL: DISCORD_BOT_TOKEN environment variable is not set!")
+    print("💡 Please set these environment variables in Railway:")
+    print("   - DISCORD_BOT_TOKEN")
+    print("   - ADMIN_IDS") 
+    print("   - PREMIUM_ROLE_ID")
+    print("   - VERIFICATION_CHANNEL_ID")
+    print("   - GUILD_ID")
+    exit(1)
+
 CODES_FILE = "redeem_codes.json"
 ORDERS_FILE = "orders.json"
 PAYMENT_TARGET = "number27"
-ADMIN_IDS = ["1388619131984806039"]
-PREMIUM_ROLE_ID = 1283132591553380479
-VERIFICATION_CHANNEL_ID = 1420479936715554928
-GUILD_ID = 1417458795461869670
-# ===================================
+ADMIN_IDS = os.getenv('ADMIN_IDS', '1388619131984806039').split(',')
+PREMIUM_ROLE_ID = int(os.getenv('PREMIUM_ROLE_ID', '1283132591553380479'))
+VERIFICATION_CHANNEL_ID = int(os.getenv('VERIFICATION_CHANNEL_ID', '1420479936715554928'))
+GUILD_ID = int(os.getenv('GUILD_ID', '1417458795461869670'))
+
+print("✅ Environment variables loaded successfully")
 
 # Get public URL from Railway
 PORT = int(os.getenv('PORT', 5000))
@@ -117,9 +132,13 @@ def home():
 def create_order():
     try:
         data = request.get_json()
+        print(f"📥 Received create_order request: {data}")
+        
         required = ['discord_id', 'amount', 'days', 'plan', 'is_code_redemption']
         if not all(field in data for field in required):
-            return jsonify({"status": "error", "message": "Missing required fields"}), 400
+            error_msg = f"Missing required fields: {required}"
+            print(f"❌ {error_msg}")
+            return jsonify({"status": "error", "message": error_msg}), 400
 
         orders = load_orders()
         order_id = f"order_{datetime.now().strftime('%Y%m%d%H%M%S')}"
@@ -131,22 +150,27 @@ def create_order():
         }
         
         save_orders(orders)
+        print(f"✅ Order created: {order_id}")
         return jsonify({"status": "success", "order_id": order_id})
     
     except Exception as e:
-        print(f"Order creation failed: {str(e)}")
+        print(f"❌ Order creation failed: {str(e)}")
         return jsonify({"status": "error", "message": str(e)}), 500
 
 @flask_app.route('/verify_payment', methods=['POST'])
 def verify_payment():
     try:
         data = request.get_json()
+        print(f"📥 Received verify_payment request: {data}")
+        
         if not data:
             return jsonify({"status": "error", "message": "No JSON data received"}), 400
 
         required = ['minecraft_username', 'amount', 'recipient']
         if not all(field in data for field in required):
-            return jsonify({"status": "error", "message": "Missing required fields"}), 400
+            error_msg = f"Missing required fields: {required}"
+            print(f"❌ {error_msg}")
+            return jsonify({"status": "error", "message": error_msg}), 400
 
         orders = load_orders()
         
@@ -189,27 +213,33 @@ def verify_payment():
             
             return jsonify({"status": "success", "order_id": order_id})
         
+        print(f"❌ No matching order found for amount: {data['amount']}")
         return jsonify({"status": "not_found", "message": "No matching pending order found for this amount"}), 404
     
     except Exception as e:
-        print(f"Payment verification failed: {str(e)}")
+        print(f"❌ Payment verification failed: {str(e)}")
         return jsonify({"status": "error", "message": str(e)}), 500
 
 @flask_app.route('/redeem_code', methods=['POST'])
 def redeem_code():
     try:
         data = request.get_json()
+        print(f"📥 Received redeem_code request: {data}")
+        
         if not data:
             return jsonify({"status": "error", "message": "No JSON data received"}), 400
 
         required = ['discord_id', 'code', 'plan', 'days']
         if not all(field in data for field in required):
-            return jsonify({"status": "error", "message": "Missing required fields"}), 400
+            error_msg = f"Missing required fields: {required}"
+            print(f"❌ {error_msg}")
+            return jsonify({"status": "error", "message": error_msg}), 400
 
         codes_data = load_codes()
         code_data = next((c for c in codes_data["codes"] if c["code"] == data["code"] and not c.get("redeemed", False)), None)
         
         if not code_data:
+            print(f"❌ Invalid code: {data['code']}")
             return jsonify({"status": "error", "message": "Invalid or already redeemed code"}), 400
 
         orders = load_orders()
@@ -237,10 +267,11 @@ def redeem_code():
         save_orders(orders)
         save_codes(codes_data)
         
+        print(f"✅ Code redeemed: {data['code']} by {data['discord_id']}")
         return jsonify({"status": "success"})
     
     except Exception as e:
-        print(f"Code redemption failed: {str(e)}")
+        print(f"❌ Code redemption failed: {str(e)}")
         return jsonify({"status": "error", "message": str(e)}), 500
 
 # ========== DISCORD COMMANDS ==========
@@ -269,34 +300,59 @@ async def purchase(interaction: discord.Interaction, plan: Literal["1d", "7d", "
             "is_code_redemption": False
         }
         
+        # Use the fixed URL with proper scheme
+        url = f"{RAILWAY_PUBLIC_URL}/create_order"
+        print(f"📤 Purchase request to: {url}")
+        print(f"📦 Payload: {payload}")
+        
         headers = {'Content-Type': 'application/json'}
-        response = requests.post(
-            f"{RAILWAY_PUBLIC_URL}/create_order", 
-            json=payload, 
-            headers=headers,
-            timeout=10
-        )
         
-        if response.status_code != 200:
-            await interaction.followup.send("❌ Server error", ephemeral=True)
-            return
+        try:
+            response = requests.post(
+                url, 
+                json=payload, 
+                headers=headers,
+                timeout=10
+            )
             
-        response_data = response.json()
-        if response_data.get("status") != "success":
-            await interaction.followup.send("❌ Error creating order", ephemeral=True)
-            return
-        
-        payment_message = (
-            f"💎 Инструкция по покупке:\n\n"
-            f"Отправьте `{amount:,}` игроку `{PAYMENT_TARGET}` на Анархии 602 (/an602)\n"
-            f"Команда: ```/pay {PAYMENT_TARGET} {amount}```\n\n"
-            f"После покупки ваш заказ передастся администрации!"
-        )
-        
-        await interaction.followup.send(payment_message, ephemeral=True)
+            print(f"📥 Response status: {response.status_code}")
+            print(f"📥 Response text: {response.text}")
+            
+            if response.status_code != 200:
+                print(f"❌ API Error: {response.status_code} - {response.text}")
+                await interaction.followup.send(f"❌ Server error: {response.status_code}", ephemeral=True)
+                return
+                
+            response_data = response.json()
+            print(f"✅ API Response: {response_data}")
+            
+            if response_data.get("status") != "success":
+                error_msg = response_data.get('message', 'Unknown error')
+                print(f"❌ API returned error: {error_msg}")
+                await interaction.followup.send(f"❌ Error: {error_msg}", ephemeral=True)
+                return
+            
+            payment_message = (
+                f"💎 Инструкция по покупке:\n\n"
+                f"Отправьте `{amount:,}` игроку `{PAYMENT_TARGET}` на Анархии 602 (/an602)\n"
+                f"Команда: ```/pay {PAYMENT_TARGET} {amount}```\n\n"
+                f"После покупки ваш заказ передастся администрации!"
+            )
+            
+            await interaction.followup.send(payment_message, ephemeral=True)
+            
+        except requests.exceptions.ConnectionError as e:
+            print(f"❌ Connection error: {e}")
+            await interaction.followup.send("❌ Cannot connect to server. Please try again later.", ephemeral=True)
+        except requests.exceptions.Timeout as e:
+            print(f"❌ Timeout error: {e}")
+            await interaction.followup.send("❌ Server timeout. Please try again.", ephemeral=True)
+        except requests.exceptions.RequestException as e:
+            print(f"❌ Request error: {e}")
+            await interaction.followup.send("❌ Network error. Please try again.", ephemeral=True)
         
     except Exception as e:
-        print(f"Purchase error: {e}")
+        print(f"❌ Purchase command error: {type(e).__name__}: {e}")
         await interaction.followup.send("❌ Error processing purchase", ephemeral=True)
 
 @bot.tree.command(name="redeem", description="Redeem a premium code")
@@ -320,9 +376,13 @@ async def redeem(interaction: discord.Interaction, code: str):
             "days": code_data["days"]
         }
         
+        # Use the fixed URL with proper scheme
+        url = f"{RAILWAY_PUBLIC_URL}/redeem_code"
+        print(f"📤 Redeem request to: {url}")
+        
         headers = {'Content-Type': 'application/json'}
         response = requests.post(
-            f"{RAILWAY_PUBLIC_URL}/redeem_code",
+            url,
             json=payload,
             headers=headers,
             timeout=10
@@ -391,8 +451,100 @@ async def redeem(interaction: discord.Interaction, code: str):
         print(f"Redeem error: {e}")
         await interaction.followup.send("❌ Error redeeming code", ephemeral=True)
 
-# Add other commands (generate_codes, check_codes) here...
+@bot.tree.command(name="generate_codes", description="[ADMIN] Generate premium codes")
+async def generate_codes(
+    interaction: discord.Interaction,
+    plan: Literal["1d", "7d", "30d", "90d", "AntiAfk-Script", "Items-Script"],
+    count: int = 1
+):
+    try:
+        if not is_admin(interaction.user.id):
+            await interaction.response.send_message("❌ No permission!", ephemeral=True)
+            return
+        
+        await interaction.response.defer(ephemeral=True)
+            
+        plan_data = {
+            "1d": {"days": 1}, "7d": {"days": 7}, "30d": {"days": 30}, "90d": {"days": 90},
+            "AntiAfk-Script": {"days": "antiafk"}, "Items-Script": {"days": "items"}
+        }
+        
+        with open(CODES_FILE, 'r') as f:
+            data = json.load(f)
+            
+        new_codes = []
+        for _ in range(min(count, 50)):
+            code = ''.join(random.choices('ABCDEFGHJKLMNPQRSTUVWXYZ23456789', k=10))
+            new_code = {
+                "code": code, 
+                "plan": plan, 
+                "days": plan_data[plan]["days"],
+                "created_at": datetime.now(timezone.utc).isoformat(), 
+                "created_by": str(interaction.user.id), 
+                "redeemed": False
+            }
+            data["codes"].append(new_code)
+            new_codes.append(f"`{code}` - {plan}")
+            
+        with open(CODES_FILE, 'w') as f:
+            json.dump(data, f, indent=4)
+        
+        codes_text = "\n".join(new_codes)
+        if len(codes_text) > 2000:
+            chunks = [codes_text[i:i+2000] for i in range(0, len(codes_text), 2000)]
+            for i, chunk in enumerate(chunks):
+                if i == 0:
+                    await interaction.followup.send(f"✅ Generated {len(new_codes)} {plan} codes:\n\n{chunk}", ephemeral=True)
+                else:
+                    await interaction.followup.send(chunk, ephemeral=True)
+        else:
+            await interaction.followup.send(f"✅ Generated {len(new_codes)} {plan} codes:\n\n{codes_text}", ephemeral=True)
+        
+    except Exception as e:
+        print(f"Generate error: {e}")
+        await interaction.followup.send("❌ Error generating codes", ephemeral=True)
 
+@bot.tree.command(name="check_codes", description="[ADMIN] Check available codes")
+async def check_codes(interaction: discord.Interaction):
+    try:
+        if not is_admin(interaction.user.id):
+            await interaction.response.send_message("❌ No permission!", ephemeral=True)
+            return
+        
+        await interaction.response.defer(ephemeral=True)
+            
+        with open(CODES_FILE, 'r') as f:
+            data = json.load(f)
+            
+        available_codes = [c for c in data["codes"] if not c["redeemed"]]
+        
+        if not available_codes:
+            await interaction.followup.send("ℹ️ No available codes", ephemeral=True)
+            return
+            
+        message = ["**Available codes:**"]
+        for code in available_codes:
+            created_at = datetime.fromisoformat(code["created_at"].replace('Z', '+00:00')).strftime("%Y-%m-%d %H:%M")
+            message.append(
+                f"`{code['code']}` - {code['plan']} (Created by <@{code['created_by']}> on {created_at})"
+            )
+        
+        full_message = "\n".join(message)
+        if len(full_message) > 2000:
+            chunks = [full_message[i:i+2000] for i in range(0, len(full_message), 2000)]
+            for i, chunk in enumerate(chunks):
+                if i == 0:
+                    await interaction.followup.send(chunk, ephemeral=True)
+                else:
+                    await interaction.followup.send(chunk, ephemeral=True)
+        else:
+            await interaction.followup.send(full_message, ephemeral=True)
+        
+    except Exception as e:
+        print(f"Check codes error: {e}")
+        await interaction.followup.send("❌ Error checking codes", ephemeral=True)
+
+# ========== DISCORD EVENTS ==========
 @bot.event
 async def on_raw_reaction_add(payload):
     """Handle reaction verification"""
@@ -514,7 +666,8 @@ async def on_ready():
 # ========== START BOTH SERVERS ==========
 def run_flask():
     port = int(os.getenv('PORT', 5000))
-    flask_app.run(host='0.0.0.0', port=port, debug=False)
+    print(f"🚀 Starting Flask server on port {port}")
+    flask_app.run(host='0.0.0.0', port=port, debug=False, use_reloader=False)
 
 if __name__ == "__main__":
     print("🚀 Starting combined Discord bot and API server...")
