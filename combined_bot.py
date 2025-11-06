@@ -32,9 +32,15 @@ print("✅ Environment variables loaded successfully")
 
 # Get public URL from Railway
 PORT = int(os.getenv('PORT', 5000))
-RAILWAY_PUBLIC_URL = os.getenv('RAILWAY_STATIC_URL', f'https://jghlasfkghas-production.up.railway.app')
+RAILWAY_PUBLIC_URL = os.getenv('RAILWAY_STATIC_URL', f'http://localhost:{PORT}')
 
-print(f"🌐 Public URL: {RAILWAY_PUBLIC_URL}")
+# Ensure URL has https:// scheme
+if RAILWAY_PUBLIC_URL.startswith('http://') or RAILWAY_PUBLIC_URL.startswith('https://'):
+    API_URL = RAILWAY_PUBLIC_URL
+else:
+    API_URL = f"https://{RAILWAY_PUBLIC_URL}"
+
+print(f"🌐 Public URL: {API_URL}")
 print(f"🔧 PORT: {PORT}")
 
 # Initialize Discord bot
@@ -294,8 +300,8 @@ async def purchase(interaction: discord.Interaction, plan: Literal["1d", "7d", "
             "is_code_redemption": False
         }
         
-        # Use the Railway URL directly
-        url = f"{RAILWAY_PUBLIC_URL}/create_order"
+        # Use the Railway URL with proper scheme
+        url = f"{API_URL}/create_order"
         print(f"📤 Purchase request to: {url}")
         print(f"📦 Payload: {payload}")
         
@@ -349,7 +355,297 @@ async def purchase(interaction: discord.Interaction, plan: Literal["1d", "7d", "
         print(f"❌ Purchase command error: {type(e).__name__}: {e}")
         await interaction.followup.send("❌ Error processing purchase", ephemeral=True)
 
-# Add other commands (redeem, generate_codes, check_codes) here...
+@bot.tree.command(name="redeem", description="Redeem a premium code")
+async def redeem(interaction: discord.Interaction, code: str):
+    try:
+        await interaction.response.defer(ephemeral=True)
+        
+        with open(CODES_FILE, 'r') as f:
+            data = json.load(f)
+        
+        code_data = next((c for c in data["codes"] if c["code"] == code and not c.get("redeemed", False)), None)
+        
+        if not code_data:
+            await interaction.followup.send("❌ Invalid or already redeemed code!", ephemeral=True)
+            return
+            
+        payload = {
+            "discord_id": str(interaction.user.id),
+            "code": code,
+            "plan": code_data["plan"],
+            "days": code_data["days"]
+        }
+        
+        headers = {'Content-Type': 'application/json'}
+        response = requests.post(
+            f"{API_URL}/redeem_code",
+            json=payload,
+            headers=headers,
+            timeout=10
+        )
+        
+        if response.status_code != 200:
+            error_msg = response.json().get('message', 'Unknown error')
+            await interaction.followup.send(
+                f"❌ Server error: {error_msg}",
+                ephemeral=True
+            )
+            return
+            
+        response_data = response.json()
+        if response_data.get("status") != "success":
+            await interaction.followup.send(
+                f"❌ Error: {response_data.get('message', 'Unknown error')}",
+                ephemeral=True
+            )
+            return
+            
+        code_data["redeemed"] = True
+        code_data["redeemed_by"] = str(interaction.user.id)
+        code_data["redeemed_at"] = datetime.utcnow().isoformat()
+        
+        with open(CODES_FILE, 'w') as f:
+            json.dump(data, f, indent=4)
+        
+        try:
+            guild = bot.get_guild(GUILD_ID)
+            if guild:
+                member = guild.get_member(interaction.user.id)
+                if member:
+                    role = guild.get_role(PREMIUM_ROLE_ID)
+                    if role:
+                        await member.add_roles(role)
+                        print(f"✅ Role assigned to {interaction.user.display_name} via code redemption")
+        except Exception as e:
+            print(f"Role assignment error: {e}")
+        
+        try:
+            dm_message = (
+                f"✅ Промокод успешно введен на {code_data['plan']}! Вы получили доступ к конфигурациям.\n\n"
+                f"Если не загружается кфг - при входе в майн копируется хвид (если не копируется то используйте https://discord.com/channels/1288902708777979904/1424880610324910121)\n"
+                f"В канале авторизации пиши `/register + хвид`\n"
+                f"**ПРИМЕР КОМАНДЫ ДЛЯ АВТОРИЗАЦИИ:** `/register hwid: 731106141075386bfac06e0f2ab053be`\n"
+                f"Канал находится в дискорд сервере невера. После авторизации перезапусти майн!"
+            )
+            dm_channel = await interaction.user.create_dm()
+            await dm_channel.send(dm_message)
+            print(f"✅ DM sent to {interaction.user.display_name} for code redemption")
+        except discord.Forbidden:
+            print(f"❌ Cannot send DM to {interaction.user.display_name} (DMs disabled)")
+        except Exception as e:
+            print(f"❌ Error sending DM for code redemption: {e}")
+        
+        await interaction.followup.send(
+            f"✅ Промокод успешно введен на {code_data['plan']}! Вы получили доступ к конфигурациям.",
+            ephemeral=True
+        )
+        
+    except Exception as e:
+        print(f"Redeem error: {e}")
+        await interaction.followup.send("❌ Error redeeming code", ephemeral=True)
+
+@bot.tree.command(name="generate_codes", description="[ADMIN] Generate premium codes")
+async def generate_codes(
+    interaction: discord.Interaction,
+    plan: Literal["1d", "7d", "30d", "90d", "AntiAfk-Script", "Items-Script"],
+    count: int = 1
+):
+    try:
+        if not is_admin(interaction.user.id):
+            await interaction.response.send_message("❌ No permission!", ephemeral=True)
+            return
+        
+        await interaction.response.defer(ephemeral=True)
+            
+        plan_data = {
+            "1d": {"days": 1}, "7d": {"days": 7}, "30d": {"days": 30}, "90d": {"days": 90},
+            "AntiAfk-Script": {"days": "antiafk"}, "Items-Script": {"days": "items"}
+        }
+        
+        with open(CODES_FILE, 'r') as f:
+            data = json.load(f)
+            
+        new_codes = []
+        for _ in range(min(count, 50)):  # Increased limit to 50
+            code = ''.join(random.choices('ABCDEFGHJKLMNPQRSTUVWXYZ23456789', k=10))
+            new_code = {
+                "code": code, 
+                "plan": plan, 
+                "days": plan_data[plan]["days"],
+                "created_at": datetime.now(timezone.utc).isoformat(), 
+                "created_by": str(interaction.user.id), 
+                "redeemed": False
+            }
+            data["codes"].append(new_code)
+            new_codes.append(f"`{code}` - {plan}")
+            
+        with open(CODES_FILE, 'w') as f:
+            json.dump(data, f, indent=4)
+        
+        # Split message if too long
+        codes_text = "\n".join(new_codes)
+        if len(codes_text) > 2000:
+            # Split into chunks
+            chunks = [codes_text[i:i+2000] for i in range(0, len(codes_text), 2000)]
+            for i, chunk in enumerate(chunks):
+                if i == 0:
+                    await interaction.followup.send(f"✅ Generated {len(new_codes)} {plan} codes:\n\n{chunk}", ephemeral=True)
+                else:
+                    await interaction.followup.send(chunk, ephemeral=True)
+        else:
+            await interaction.followup.send(f"✅ Generated {len(new_codes)} {plan} codes:\n\n{codes_text}", ephemeral=True)
+        
+    except Exception as e:
+        print(f"Generate error: {e}")
+        await interaction.followup.send("❌ Error generating codes", ephemeral=True)
+
+@bot.tree.command(name="check_codes", description="[ADMIN] Check available codes")
+async def check_codes(interaction: discord.Interaction):
+    try:
+        if not is_admin(interaction.user.id):
+            await interaction.response.send_message("❌ No permission!", ephemeral=True)
+            return
+        
+        await interaction.response.defer(ephemeral=True)
+            
+        with open(CODES_FILE, 'r') as f:
+            data = json.load(f)
+            
+        available_codes = [c for c in data["codes"] if not c["redeemed"]]
+        
+        if not available_codes:
+            await interaction.followup.send("ℹ️ No available codes", ephemeral=True)
+            return
+            
+        message = ["**Available codes:**"]
+        for code in available_codes:
+            created_at = datetime.fromisoformat(code["created_at"].replace('Z', '+00:00')).strftime("%Y-%m-%d %H:%M")
+            message.append(
+                f"`{code['code']}` - {code['plan']} (Created by <@{code['created_by']}> on {created_at})"
+            )
+        
+        full_message = "\n".join(message)
+        if len(full_message) > 2000:
+            chunks = [full_message[i:i+2000] for i in range(0, len(full_message), 2000)]
+            for i, chunk in enumerate(chunks):
+                if i == 0:
+                    await interaction.followup.send(chunk, ephemeral=True)
+                else:
+                    await interaction.followup.send(chunk, ephemeral=True)
+        else:
+            await interaction.followup.send(full_message, ephemeral=True)
+        
+    except Exception as e:
+        print(f"Check codes error: {e}")
+        await interaction.followup.send("❌ Error checking codes", ephemeral=True)
+
+@bot.event
+async def on_raw_reaction_add(payload):
+    """Handle reaction verification"""
+    try:
+        if payload.channel_id != VERIFICATION_CHANNEL_ID:
+            return
+            
+        if str(payload.emoji) != "✅":
+            return
+            
+        if not is_admin(payload.user_id):
+            return
+            
+        channel = bot.get_channel(payload.channel_id)
+        if not channel:
+            return
+            
+        message = await channel.fetch_message(payload.message_id)
+        
+        if not message.embeds:
+            return
+            
+        embed = message.embeds[0]
+        if "Payment Verification Required" not in embed.title:
+            return
+        
+        order_id = None
+        for field in embed.fields:
+            if field.name == "Order ID":
+                order_id = field.value.strip('`')
+                break
+        
+        if not order_id:
+            return
+        
+        await verify_order_from_reaction(order_id, payload.user_id, message)
+        
+    except Exception as e:
+        print(f"Reaction verification error: {e}")
+
+async def verify_order_from_reaction(order_id, admin_id, message):
+    """Verify order when admin reacts with ✅"""
+    try:
+        embed = message.embeds[0]
+        discord_id = None
+        plan = None
+        amount = None
+        
+        for field in embed.fields:
+            if field.name == "Discord User":
+                discord_id = field.value.replace('<@', '').replace('>', '').strip()
+            elif field.name == "Plan":
+                plan = field.value.strip('`')
+            elif field.name == "Amount":
+                amount = field.value.strip('`').replace(',', '')
+        
+        if not discord_id:
+            print("❌ Could not extract Discord ID from embed")
+            return
+            
+        guild = bot.get_guild(GUILD_ID)
+        if not guild:
+            print(f"Guild {GUILD_ID} not found")
+            return
+            
+        member = guild.get_member(int(discord_id))
+        if member:
+            role = guild.get_role(PREMIUM_ROLE_ID)
+            if role:
+                await member.add_roles(role)
+                print(f"✅ Role {PREMIUM_ROLE_ID} assigned to {member.display_name}")
+                
+                try:
+                    admin_user = await bot.fetch_user(admin_id)
+                    dm_message = (
+                        f"🎉 Ваша покупка подтверждена! Вы получили доступ к конфигурациям.\n\n"
+                        f"**Детали заказа:**\n"
+                        f"• План: {plan}\n"
+                        f"• Сумма: {int(amount):,}\n"
+                        f"• Подтверждено: {admin_user.display_name}\n\n"
+                        f"Если не загружается кфг - при входе в майн копируется хвид (если не копируется то используйте https://discord.com/channels/1288902708777979904/1424880610324910121)\n"
+                        f"В канале авторизации пиши `/register + хвид`\n"
+                        f"**ПРИМЕР КОМАНДЫ ДЛЯ АВТОРИЗАЦИИ:** `/register hwid: 731106141075386bfac06e0f2ab053be`\n"
+                        f"Канал находится в дискорд сервере невера. После авторизации перезапусти майн!"
+                    )
+                    
+                    dm_channel = await member.create_dm()
+                    await dm_channel.send(dm_message)
+                    print(f"✅ DM sent to {member.display_name}")
+                    
+                except discord.Forbidden:
+                    print(f"❌ Cannot send DM to {member.display_name} (DMs disabled)")
+                except Exception as e:
+                    print(f"❌ Error sending DM: {e}")
+        
+        embed.title = "✅ Payment Verified"
+        embed.color = discord.Color.green()
+        embed.add_field(name="✅ Verified By", value=f"<@{admin_id}>", inline=True)
+        embed.add_field(name="🕒 Verified At", value=f"<t:{int(datetime.now(timezone.utc).timestamp())}:R>", inline=True)
+        
+        await message.edit(embed=embed)
+        await message.clear_reactions()
+        
+        print(f"Order {order_id} verified by {admin_id}")
+        
+    except Exception as e:
+        print(f"Order verification error: {e}")
 
 @bot.event
 async def on_ready():
@@ -357,7 +653,7 @@ async def on_ready():
     try:
         synced = await bot.tree.sync()
         print(f"✅ Synced {len(synced)} commands")
-        print(f"🌐 API Server URL: {RAILWAY_PUBLIC_URL}")
+        print(f"🌐 API Server URL: {API_URL}")
     except Exception as e:
         print(f"❌ Sync error: {e}")
 
