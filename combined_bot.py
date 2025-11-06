@@ -7,7 +7,7 @@ from typing import Literal
 from datetime import datetime, timezone
 import asyncio
 
-print("🚀 Starting Discord bot with built-in payment processing...")
+print("🚀 Starting Discord bot with payment processing...")
 
 # ========== CONFIGURATION ==========
 DISCORD_BOT_TOKEN = os.getenv('DISCORD_BOT_TOKEN')
@@ -100,8 +100,8 @@ async def send_verification_message(discord_id, amount, plan, minecraft_username
         print(f"Error sending verification message: {e}")
         return None
 
-async def send_direct_payment_message(minecraft_username, amount, plan, order_id):
-    """Send message for direct payments (without Discord user)"""
+async def send_direct_payment_notification(minecraft_username, amount, plan):
+    """Send notification about direct payment that needs manual processing"""
     try:
         channel = bot.get_channel(VERIFICATION_CHANNEL_ID)
         if not channel:
@@ -109,98 +109,59 @@ async def send_direct_payment_message(minecraft_username, amount, plan, order_id
             return None
 
         embed = discord.Embed(
-            title="💰 Direct Payment Received",
+            title="💰 Minecraft Payment Detected",
             color=0x00FF00,
-            description="**⚡ Direct payment detected! React with ✅ to verify**",
+            description=f"**Payment of `{amount:,}` received from `{minecraft_username}`**",
             timestamp=datetime.now(timezone.utc)
         )
         
         embed.add_field(name="Minecraft Username", value=f"```{minecraft_username}```", inline=True)
         embed.add_field(name="Amount", value=f"```{amount:,}```", inline=True)
         embed.add_field(name="Detected Plan", value=f"```{plan}```", inline=True)
-        embed.add_field(name="Order ID", value=f"```{order_id}```", inline=False)
-        embed.add_field(name="Status", value="🟡 **Needs Manual Verification**", inline=False)
-        embed.add_field(name="Action", value="Ask user for Discord ID and use `/manual_verify` command", inline=False)
+        embed.add_field(name="Status", value="🟡 **Needs Manual Processing**", inline=False)
+        embed.add_field(name="Action Required", value="Use `/manual_add` command to assign this payment to a Discord user", inline=False)
         
         message = await channel.send(embed=embed)
-        await message.add_reaction("✅")
         
-        print(f"✅ Direct payment message sent for order {order_id}")
+        print(f"✅ Direct payment notification sent for {minecraft_username}")
         return message
         
     except Exception as e:
-        print(f"Error sending direct payment message: {e}")
+        print(f"Error sending direct payment notification: {e}")
         return None
 
-def process_direct_payment(minecraft_username, amount):
-    """Process direct payment from Minecraft (called via HTTP or internally)"""
-    try:
-        print(f"💰 Processing direct payment: {amount} from {minecraft_username}")
-        
-        # Try to find which plan this amount corresponds to
-        plan_ranges = {
-            "1d": (19_000_000, 20_000_000),
-            "7d": (49_000_000, 50_000_000), 
-            "30d": (119_000_000, 120_000_000),
-            "90d": (199_000_000, 200_000_000),
-            "AntiAfk-Script": (99_000_000, 100_000_000),
-            "Items-Script": (199_000_000, 200_000_000)
-        }
-        
-        plan = "Unknown"
-        days = 1
-        
-        for plan_name, (min_price, max_price) in plan_ranges.items():
-            if min_price <= amount <= max_price:
-                plan = plan_name
-                if plan_name == "1d":
-                    days = 1
-                elif plan_name == "7d":
-                    days = 7
-                elif plan_name == "30d":
-                    days = 30
-                elif plan_name == "90d":
-                    days = 90
-                elif plan_name == "AntiAfk-Script":
-                    days = "antiafk"
-                elif plan_name == "Items-Script":
-                    days = "items"
-                break
-        
-        # Create the order
-        orders = load_orders()
-        order_id = f"direct_{datetime.now().strftime('%Y%m%d%H%M%S')}"
-        
-        orders[order_id] = {
-            "discord_id": "unknown",
-            "amount": amount,
-            "days": days,
-            "plan": plan,
-            "status": "paid",
-            "is_code_redemption": False,
-            "created_at": datetime.now().isoformat(),
-            "paid_at": datetime.now().isoformat(),
-            "minecraft_username": minecraft_username,
-            "needs_verification": True
-        }
-        
-        save_orders(orders)
-        
-        print(f"💰 Direct payment recorded - Order: {order_id}, Player: {minecraft_username}, Amount: {amount}, Plan: {plan}")
-        
-        # Send verification message to Discord
-        asyncio.create_task(send_direct_payment_message(minecraft_username, amount, plan, order_id))
-        
-        return {
-            "status": "success", 
-            "order_id": order_id,
-            "plan": plan,
-            "message": "Payment recorded, awaiting admin verification"
-        }
-        
-    except Exception as e:
-        print(f"❌ Direct payment processing failed: {str(e)}")
-        return {"status": "error", "message": str(e)}
+def detect_plan_from_amount(amount):
+    """Detect which plan corresponds to the payment amount"""
+    plan_ranges = {
+        "1d": (19_000_000, 20_000_000),
+        "7d": (49_000_000, 50_000_000), 
+        "30d": (119_000_000, 120_000_000),
+        "90d": (199_000_000, 200_000_000),
+        "AntiAfk-Script": (99_000_000, 100_000_000),
+        "Items-Script": (199_000_000, 200_000_000)
+    }
+    
+    plan = "Unknown"
+    days = 1
+    
+    for plan_name, (min_price, max_price) in plan_ranges.items():
+        if min_price <= amount <= max_price:
+            plan = plan_name
+            if plan_name == "1d":
+                days = 1
+            elif plan_name == "7d":
+                days = 7
+            elif plan_name == "30d":
+                days = 30
+            elif plan_name == "90d":
+                days = 90
+            elif plan_name == "AntiAfk-Script":
+                days = "antiafk"
+            elif plan_name == "Items-Script":
+                days = "items"
+            break
+    
+    return plan, days
 
 # ========== DISCORD COMMANDS ==========
 @bot.tree.command(name="purchase", description="Purchase premium access")
@@ -220,7 +181,7 @@ async def purchase(interaction: discord.Interaction, plan: Literal["1d", "7d", "
         amount = plans[plan]["price"]
         days = plans[plan]["days"]
         
-        # Create order directly
+        # Create order
         orders = load_orders()
         order_id = f"order_{datetime.now().strftime('%Y%m%d%H%M%S')}"
         
@@ -236,11 +197,15 @@ async def purchase(interaction: discord.Interaction, plan: Literal["1d", "7d", "
         
         save_orders(orders)
         
+        # Send verification message
+        await send_verification_message(interaction.user.id, amount, plan, None, order_id)
+        
         payment_message = (
             f"💎 Инструкция по покупке:\n\n"
             f"Отправьте `{amount:,}` игроку `{PAYMENT_TARGET}` на Анархии 602 (/an602)\n"
             f"Команда: ```/pay {PAYMENT_TARGET} {amount}```\n\n"
-            f"После покупки ваш заказ передастся администрации!"
+            f"После отправки денег ваш заказ будет автоматически проверен администрацией!\n"
+            f"Не нужно пинговать админов - они увидят ваш заказ автоматически."
         )
         
         await interaction.followup.send(payment_message, ephemeral=True)
@@ -249,8 +214,8 @@ async def purchase(interaction: discord.Interaction, plan: Literal["1d", "7d", "
         print(f"❌ Purchase command error: {type(e).__name__}: {e}")
         await interaction.followup.send("❌ Error processing purchase", ephemeral=True)
 
-@bot.tree.command(name="manual_verify", description="[ADMIN] Manually verify a direct payment")
-async def manual_verify(interaction: discord.Interaction, order_id: str, discord_id: str):
+@bot.tree.command(name="manual_add", description="[ADMIN] Manually add a Minecraft payment")
+async def manual_add(interaction: discord.Interaction, minecraft_username: str, amount: int, discord_user: discord.User):
     try:
         if not is_admin(interaction.user.id):
             await interaction.response.send_message("❌ No permission!", ephemeral=True)
@@ -258,30 +223,34 @@ async def manual_verify(interaction: discord.Interaction, order_id: str, discord
         
         await interaction.response.defer(ephemeral=True)
         
+        # Detect plan from amount
+        plan, days = detect_plan_from_amount(amount)
+        
+        # Create order
         orders = load_orders()
+        order_id = f"manual_{datetime.now().strftime('%Y%m%d%H%M%S')}"
         
-        if order_id not in orders:
-            await interaction.followup.send("❌ Order not found!", ephemeral=True)
-            return
-            
-        order = orders[order_id]
-        
-        if order.get("status") == "verified":
-            await interaction.followup.send("❌ Order already verified!", ephemeral=True)
-            return
-        
-        # Update order with Discord ID
-        orders[order_id]["discord_id"] = discord_id
-        orders[order_id]["status"] = "verified"
-        orders[order_id]["verified_at"] = datetime.now().isoformat()
-        orders[order_id]["verified_by"] = str(interaction.user.id)
+        orders[order_id] = {
+            "discord_id": str(discord_user.id),
+            "amount": amount,
+            "days": days,
+            "plan": plan,
+            "status": "verified",
+            "is_code_redemption": False,
+            "created_at": datetime.now().isoformat(),
+            "paid_at": datetime.now().isoformat(),
+            "verified_at": datetime.now().isoformat(),
+            "minecraft_username": minecraft_username,
+            "verified_by": str(interaction.user.id),
+            "manual_add": True
+        }
         
         save_orders(orders)
         
         # Assign role
         guild = bot.get_guild(GUILD_ID)
         if guild:
-            member = guild.get_member(int(discord_id))
+            member = guild.get_member(discord_user.id)
             if member:
                 role = guild.get_role(PREMIUM_ROLE_ID)
                 if role:
@@ -292,8 +261,9 @@ async def manual_verify(interaction: discord.Interaction, order_id: str, discord
                         dm_message = (
                             f"🎉 Ваша покупка подтверждена! Вы получили доступ к конфигурациям.\n\n"
                             f"**Детали заказа:**\n"
-                            f"• План: {order['plan']}\n"
-                            f"• Сумма: {order['amount']:,}\n"
+                            f"• План: {plan}\n"
+                            f"• Сумма: {amount:,}\n"
+                            f"• Minecraft: {minecraft_username}\n"
                             f"• Подтверждено: {interaction.user.display_name}\n\n"
                             f"Если не загружается кфг - при входе в майн копируется хвид (если не копируется то используйте https://discord.com/channels/1288902708777979904/1424880610324910121)\n"
                             f"В канале авторизации пиши `/register + хвид`\n"
@@ -310,11 +280,19 @@ async def manual_verify(interaction: discord.Interaction, order_id: str, discord
                     except Exception as e:
                         print(f"❌ Error sending DM: {e}")
         
-        await interaction.followup.send(f"✅ Order {order_id} verified! Role assigned to <@{discord_id}>", ephemeral=True)
+        await interaction.followup.send(
+            f"✅ Payment added successfully!\n"
+            f"• Minecraft: `{minecraft_username}`\n"
+            f"• Amount: `{amount:,}`\n" 
+            f"• Plan: `{plan}`\n"
+            f"• Discord: {discord_user.mention}\n"
+            f"• Role assigned: ✅",
+            ephemeral=True
+        )
         
     except Exception as e:
-        print(f"Manual verify error: {e}")
-        await interaction.followup.send("❌ Error verifying order", ephemeral=True)
+        print(f"Manual add error: {e}")
+        await interaction.followup.send("❌ Error adding manual payment", ephemeral=True)
 
 @bot.tree.command(name="redeem", description="Redeem a premium code")
 async def redeem(interaction: discord.Interaction, code: str):
@@ -330,7 +308,7 @@ async def redeem(interaction: discord.Interaction, code: str):
             await interaction.followup.send("❌ Invalid or already redeemed code!", ephemeral=True)
             return
             
-        # Process code redemption locally
+        # Process code redemption
         codes_data = load_codes()
         code_data_local = next((c for c in codes_data["codes"] if c["code"] == code and not c.get("redeemed", False)), None)
         
@@ -527,10 +505,7 @@ async def on_raw_reaction_add(payload):
             
         embed = message.embeds[0]
         
-        is_payment_embed = ("Payment Verification Required" in embed.title or 
-                           "Direct Payment Received" in embed.title)
-        
-        if not is_payment_embed:
+        if "Payment Verification Required" not in embed.title:
             return
         
         order_id = None
@@ -552,66 +527,61 @@ async def verify_order_from_reaction(order_id, admin_id, message):
     try:
         embed = message.embeds[0]
         discord_id = None
-        minecraft_username = None
         plan = None
         amount = None
         
         for field in embed.fields:
             if field.name == "Discord User":
                 discord_id = field.value.replace('<@', '').replace('>', '').strip()
-            elif field.name == "Minecraft Username":
-                minecraft_username = field.value.strip('`')
             elif field.name == "Plan":
                 plan = field.value.strip('`')
             elif field.name == "Amount":
                 amount = field.value.strip('`').replace(',', '')
         
+        if not discord_id:
+            print("❌ Could not extract Discord ID from embed")
+            return
+            
         # Update order status
         orders = load_orders()
         if order_id in orders:
             orders[order_id]["status"] = "verified"
             orders[order_id]["verified_at"] = datetime.now().isoformat()
             orders[order_id]["verified_by"] = str(admin_id)
-            
-            # If this was a direct payment, we might not have a Discord ID yet
-            if not discord_id and "discord_id" in orders[order_id] and orders[order_id]["discord_id"] != "unknown":
-                discord_id = orders[order_id]["discord_id"]
-            
             save_orders(orders)
         
-        # Assign role if we have Discord ID
-        if discord_id and discord_id != "unknown":
-            guild = bot.get_guild(GUILD_ID)
-            if guild:
-                member = guild.get_member(int(discord_id))
-                if member:
-                    role = guild.get_role(PREMIUM_ROLE_ID)
-                    if role:
-                        await member.add_roles(role)
-                        print(f"✅ Role {PREMIUM_ROLE_ID} assigned to {member.display_name}")
+        # Assign role
+        guild = bot.get_guild(GUILD_ID)
+        if guild:
+            member = guild.get_member(int(discord_id))
+            if member:
+                role = guild.get_role(PREMIUM_ROLE_ID)
+                if role:
+                    await member.add_roles(role)
+                    print(f"✅ Role {PREMIUM_ROLE_ID} assigned to {member.display_name}")
+                    
+                    try:
+                        admin_user = await bot.fetch_user(admin_id)
+                        dm_message = (
+                            f"🎉 Ваша покупка подтверждена! Вы получили доступ к конфигурациям.\n\n"
+                            f"**Детали заказа:**\n"
+                            f"• План: {plan}\n"
+                            f"• Сумма: {int(amount):,}\n"
+                            f"• Подтверждено: {admin_user.display_name}\n\n"
+                            f"Если не загружается кфг - при входе в майн копируется хвид (если не копируется то используйте https://discord.com/channels/1288902708777979904/1424880610324910121)\n"
+                            f"В канале авторизации пиши `/register + хвид`\n"
+                            f"**ПРИМЕР КОМАНДЫ ДЛЯ АВТОРИЗАЦИИ:** `/register hwid: 731106141075386bfac06e0f2ab053be`\n"
+                            f"Канал находится в дискорд сервере невера. После авторизации перезапусти майн!"
+                        )
                         
-                        try:
-                            admin_user = await bot.fetch_user(admin_id)
-                            dm_message = (
-                                f"🎉 Ваша покупка подтверждена! Вы получили доступ к конфигурациям.\n\n"
-                                f"**Детали заказа:**\n"
-                                f"• План: {plan}\n"
-                                f"• Сумма: {int(amount):,}\n"
-                                f"• Подтверждено: {admin_user.display_name}\n\n"
-                                f"Если не загружается кфг - при входе в майн копируется хвид (если не копируется то используйте https://discord.com/channels/1288902708777979904/1424880610324910121)\n"
-                                f"В канале авторизации пиши `/register + хвид`\n"
-                                f"**ПРИМЕР КОМАНДЫ ДЛЯ АВТОРИЗАЦИИ:** `/register hwid: 731106141075386bfac06e0f2ab053be`\n"
-                                f"Канал находится в дискорд сервере невера. После авторизации перезапусти майн!"
-                            )
-                            
-                            dm_channel = await member.create_dm()
-                            await dm_channel.send(dm_message)
-                            print(f"✅ DM sent to {member.display_name}")
-                            
-                        except discord.Forbidden:
-                            print(f"❌ Cannot send DM to {member.display_name} (DMs disabled)")
-                        except Exception as e:
-                            print(f"❌ Error sending DM: {e}")
+                        dm_channel = await member.create_dm()
+                        await dm_channel.send(dm_message)
+                        print(f"✅ DM sent to {member.display_name}")
+                        
+                    except discord.Forbidden:
+                        print(f"❌ Cannot send DM to {member.display_name} (DMs disabled)")
+                    except Exception as e:
+                        print(f"❌ Error sending DM: {e}")
         
         embed.title = "✅ Payment Verified"
         embed.color = discord.Color.green()
@@ -636,68 +606,14 @@ async def on_ready():
     except Exception as e:
         print(f"❌ Sync error: {e}")
 
-# Simple HTTP server for Minecraft payments
-import http.server
-import socketserver
-import threading
-
-class PaymentHandler(http.server.SimpleHTTPRequestHandler):
-    def do_POST(self):
-        if self.path == '/direct_payment':
-            content_length = int(self.headers['Content-Length'])
-            post_data = self.rfile.read(content_length)
-            
-            try:
-                data = json.loads(post_data.decode('utf-8'))
-                minecraft_username = data.get('minecraft_username')
-                amount = data.get('amount')
-                
-                if minecraft_username and amount:
-                    result = process_direct_payment(minecraft_username, amount)
-                    
-                    self.send_response(200)
-                    self.send_header('Content-type', 'application/json')
-                    self.send_header('Access-Control-Allow-Origin', '*')
-                    self.end_headers()
-                    self.wfile.write(json.dumps(result).encode('utf-8'))
-                else:
-                    self.send_response(400)
-                    self.end_headers()
-                    
-            except Exception as e:
-                print(f"HTTP payment error: {e}")
-                self.send_response(500)
-                self.end_headers()
-        else:
-            self.send_response(404)
-            self.end_headers()
-    
-    def do_OPTIONS(self):
-        self.send_response(200)
-        self.send_header('Access-Control-Allow-Origin', '*')
-        self.send_header('Access-Control-Allow-Methods', 'POST, OPTIONS')
-        self.send_header('Access-Control-Allow-Headers', 'Content-Type')
-        self.end_headers()
-
-def run_http_server():
-    PORT = 8080
-    with socketserver.TCPServer(("", PORT), PaymentHandler) as httpd:
-        print(f"🌐 HTTP payment server running on port {PORT}")
-        httpd.serve_forever()
-
 if __name__ == "__main__":
-    print("🚀 Starting Discord bot with HTTP payment server...")
+    print("🚀 Starting Discord bot...")
     
     if not DISCORD_BOT_TOKEN:
         print("❌ DISCORD_BOT_TOKEN environment variable is required!")
         exit(1)
     
-    # Start HTTP server in a separate thread
-    http_thread = threading.Thread(target=run_http_server, daemon=True)
-    http_thread.start()
-    print("✅ HTTP payment server started on port 8080")
-    
-    # Start Discord bot in the main thread
+    # Start Discord bot
     print("✅ Starting Discord bot...")
     try:
         bot.run(DISCORD_BOT_TOKEN)
