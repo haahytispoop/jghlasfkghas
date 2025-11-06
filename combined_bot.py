@@ -32,15 +32,17 @@ print("✅ Environment variables loaded successfully")
 
 # Get public URL from Railway
 PORT = int(os.getenv('PORT', 5000))
-RAILWAY_PUBLIC_URL = os.getenv('RAILWAY_STATIC_URL', f'http://localhost:{PORT}')
+RAILWAY_PUBLIC_URL = os.getenv('RAILWAY_STATIC_URL')
 
-# Ensure URL has https:// scheme
-if RAILWAY_PUBLIC_URL.startswith('http://') or RAILWAY_PUBLIC_URL.startswith('https://'):
-    API_URL = RAILWAY_PUBLIC_URL
-else:
+# Use Railway's internal URL for API calls
+if RAILWAY_PUBLIC_URL:
     API_URL = f"https://{RAILWAY_PUBLIC_URL}"
+else:
+    # Fallback for local development
+    API_URL = f"http://localhost:{PORT}"
 
-print(f"🌐 Public URL: {API_URL}")
+print(f"🌐 Public URL: {RAILWAY_PUBLIC_URL}")
+print(f"🔧 API URL: {API_URL}")
 print(f"🔧 PORT: {PORT}")
 
 # Initialize Discord bot
@@ -123,7 +125,11 @@ async def send_bot_message(discord_id, amount, plan, minecraft_username=None, or
 # ========== FLASK ROUTES ==========
 @flask_app.route('/')
 def home():
-    return jsonify({"status": "online", "service": "Discord Bot API"})
+    return jsonify({"status": "online", "service": "Discord Bot API", "timestamp": datetime.now().isoformat()})
+
+@flask_app.route('/health')
+def health():
+    return jsonify({"status": "healthy", "timestamp": datetime.now().isoformat()})
 
 @flask_app.route('/create_order', methods=['POST'])
 def create_order():
@@ -312,16 +318,67 @@ async def purchase(interaction: discord.Interaction, plan: Literal["1d", "7d", "
                 url, 
                 json=payload, 
                 headers=headers,
-                timeout=10
+                timeout=30  # Increased timeout
             )
             
             print(f"📥 Response status: {response.status_code}")
             print(f"📥 Response text: {response.text}")
             
+            if response.status_code == 502:
+                # If we get 502, try using internal communication
+                print("🔄 502 error detected, trying internal API call...")
+                try:
+                    # Direct internal call
+                    with flask_app.test_client() as client:
+                        internal_response = client.post('/create_order', json=payload)
+                        print(f"📥 Internal response status: {internal_response.status_code}")
+                        print(f"📥 Internal response data: {internal_response.get_data(as_text=True)}")
+                        
+                        if internal_response.status_code == 200:
+                            response_data = internal_response.get_json()
+                            if response_data.get("status") == "success":
+                                payment_message = (
+                                    f"💎 Инструкция по покупке:\n\n"
+                                    f"Отправьте `{amount:,}` игроку `{PAYMENT_TARGET}` на Анархии 602 (/an602)\n"
+                                    f"Команда: ```/pay {PAYMENT_TARGET} {amount}```\n\n"
+                                    f"После покупки ваш заказ передастся администрации!"
+                                )
+                                await interaction.followup.send(payment_message, ephemeral=True)
+                                return
+                
+                except Exception as internal_error:
+                    print(f"❌ Internal API call failed: {internal_error}")
+            
             if response.status_code != 200:
                 print(f"❌ API Error: {response.status_code} - {response.text}")
-                await interaction.followup.send(f"❌ Server error: {response.status_code}", ephemeral=True)
-                return
+                # Fallback: create order locally
+                print("🔄 Falling back to local order creation...")
+                try:
+                    orders = load_orders()
+                    order_id = f"order_{datetime.now().strftime('%Y%m%d%H%M%S')}"
+                    
+                    orders[order_id] = {
+                        **payload,
+                        "status": "pending",
+                        "created_at": datetime.now().isoformat()
+                    }
+                    
+                    save_orders(orders)
+                    
+                    payment_message = (
+                        f"💎 Инструкция по покупке:\n\n"
+                        f"Отправьте `{amount:,}` игроку `{PAYMENT_TARGET}` на Анархии 602 (/an602)\n"
+                        f"Команда: ```/pay {PAYMENT_TARGET} {amount}```\n\n"
+                        f"После покупки ваш заказ передастся администрации!"
+                    )
+                    
+                    await interaction.followup.send(payment_message, ephemeral=True)
+                    return
+                    
+                except Exception as fallback_error:
+                    print(f"❌ Fallback also failed: {fallback_error}")
+                    await interaction.followup.send("❌ Server temporarily unavailable. Please try again in a few moments.", ephemeral=True)
+                    return
                 
             response_data = response.json()
             print(f"✅ API Response: {response_data}")
@@ -343,7 +400,30 @@ async def purchase(interaction: discord.Interaction, plan: Literal["1d", "7d", "
             
         except requests.exceptions.ConnectionError as e:
             print(f"❌ Connection error: {e}")
-            await interaction.followup.send("❌ Cannot connect to server. Please try again later.", ephemeral=True)
+            # Fallback to local order creation
+            try:
+                orders = load_orders()
+                order_id = f"order_{datetime.now().strftime('%Y%m%d%H%M%S')}"
+                
+                orders[order_id] = {
+                    **payload,
+                    "status": "pending",
+                    "created_at": datetime.now().isoformat()
+                }
+                
+                save_orders(orders)
+                
+                payment_message = (
+                    f"💎 Инструкция по покупке:\n\n"
+                    f"Отправьте `{amount:,}` игроку `{PAYMENT_TARGET}` на Анархии 602 (/an602)\n"
+                    f"Команда: ```/pay {PAYMENT_TARGET} {amount}```\n\n"
+                    f"После покупки ваш заказ передастся администрации!"
+                )
+                
+                await interaction.followup.send(payment_message, ephemeral=True)
+            except Exception as fallback_error:
+                print(f"❌ Fallback failed: {fallback_error}")
+                await interaction.followup.send("❌ Cannot connect to server. Please try again later.", ephemeral=True)
         except requests.exceptions.Timeout as e:
             print(f"❌ Timeout error: {e}")
             await interaction.followup.send("❌ Server timeout. Please try again.", ephemeral=True)
@@ -354,6 +434,9 @@ async def purchase(interaction: discord.Interaction, plan: Literal["1d", "7d", "
     except Exception as e:
         print(f"❌ Purchase command error: {type(e).__name__}: {e}")
         await interaction.followup.send("❌ Error processing purchase", ephemeral=True)
+
+# Add other commands (redeem, generate_codes, check_codes) here...
+# [Include all the other commands from the previous version: redeem, generate_codes, check_codes, on_raw_reaction_add, verify_order_from_reaction]
 
 @bot.tree.command(name="redeem", description="Redeem a premium code")
 async def redeem(interaction: discord.Interaction, code: str):
@@ -377,29 +460,62 @@ async def redeem(interaction: discord.Interaction, code: str):
         }
         
         headers = {'Content-Type': 'application/json'}
-        response = requests.post(
-            f"{API_URL}/redeem_code",
-            json=payload,
-            headers=headers,
-            timeout=10
-        )
         
-        if response.status_code != 200:
-            error_msg = response.json().get('message', 'Unknown error')
-            await interaction.followup.send(
-                f"❌ Server error: {error_msg}",
-                ephemeral=True
+        try:
+            response = requests.post(
+                f"{API_URL}/redeem_code",
+                json=payload,
+                headers=headers,
+                timeout=30
             )
-            return
             
-        response_data = response.json()
-        if response_data.get("status") != "success":
-            await interaction.followup.send(
-                f"❌ Error: {response_data.get('message', 'Unknown error')}",
-                ephemeral=True
-            )
-            return
+            if response.status_code != 200:
+                # Fallback to local processing
+                raise Exception("API unavailable, using fallback")
+                
+            response_data = response.json()
+            if response_data.get("status") != "success":
+                await interaction.followup.send(
+                    f"❌ Error: {response_data.get('message', 'Unknown error')}",
+                    ephemeral=True
+                )
+                return
+                
+        except:
+            # Local processing fallback
+            codes_data = load_codes()
+            code_data_local = next((c for c in codes_data["codes"] if c["code"] == code and not c.get("redeemed", False)), None)
             
+            if not code_data_local:
+                await interaction.followup.send("❌ Invalid or already redeemed code!", ephemeral=True)
+                return
+
+            orders = load_orders()
+            order_id = f"redeem_{datetime.now().strftime('%Y%m%d%H%M%S')}"
+            
+            orders[order_id] = {
+                "discord_id": str(interaction.user.id),
+                "amount": 0,
+                "days": code_data_local["days"],
+                "plan": code_data_local["plan"],
+                "status": "verified",
+                "is_code_redemption": True,
+                "created_at": datetime.now().isoformat(),
+                "paid_at": datetime.now().isoformat(),
+                "verified_at": datetime.now().isoformat(),
+                "code_used": code
+            }
+            
+            code_data_local.update({
+                "redeemed": True,
+                "redeemed_by": str(interaction.user.id),
+                "redeemed_at": datetime.now().isoformat()
+            })
+            
+            save_orders(orders)
+            save_codes(codes_data)
+            
+        # Update the original code data for role assignment
         code_data["redeemed"] = True
         code_data["redeemed_by"] = str(interaction.user.id)
         code_data["redeemed_at"] = datetime.utcnow().isoformat()
@@ -466,7 +582,7 @@ async def generate_codes(
             data = json.load(f)
             
         new_codes = []
-        for _ in range(min(count, 50)):  # Increased limit to 50
+        for _ in range(min(count, 50)):
             code = ''.join(random.choices('ABCDEFGHJKLMNPQRSTUVWXYZ23456789', k=10))
             new_code = {
                 "code": code, 
@@ -482,10 +598,8 @@ async def generate_codes(
         with open(CODES_FILE, 'w') as f:
             json.dump(data, f, indent=4)
         
-        # Split message if too long
         codes_text = "\n".join(new_codes)
         if len(codes_text) > 2000:
-            # Split into chunks
             chunks = [codes_text[i:i+2000] for i in range(0, len(codes_text), 2000)]
             for i, chunk in enumerate(chunks):
                 if i == 0:
@@ -654,6 +768,14 @@ async def on_ready():
         synced = await bot.tree.sync()
         print(f"✅ Synced {len(synced)} commands")
         print(f"🌐 API Server URL: {API_URL}")
+        
+        # Test the API endpoint
+        try:
+            response = requests.get(f"{API_URL}/health", timeout=10)
+            print(f"🌐 API Health check: {response.status_code}")
+        except:
+            print("⚠️  API health check failed - running in fallback mode")
+        
     except Exception as e:
         print(f"❌ Sync error: {e}")
 
@@ -661,9 +783,10 @@ async def on_ready():
 def run_flask():
     port = int(os.getenv('PORT', 5000))
     print(f"🚀 Starting Flask server on port {port}")
-    # Use waitress for production instead of Flask dev server
+    
+    # Use production server
     from waitress import serve
-    serve(flask_app, host='0.0.0.0', port=port)
+    serve(flask_app, host='0.0.0.0', port=port, threads=4)
 
 if __name__ == "__main__":
     print("🚀 Starting combined Discord bot and API server...")
@@ -679,4 +802,7 @@ if __name__ == "__main__":
     
     # Start Discord bot in the main thread
     print("✅ Starting Discord bot...")
-    bot.run(DISCORD_BOT_TOKEN)
+    try:
+        bot.run(DISCORD_BOT_TOKEN)
+    except Exception as e:
+        print(f"❌ Discord bot failed: {e}")
