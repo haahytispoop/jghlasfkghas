@@ -15,7 +15,6 @@ print("🚀 Starting combined Discord bot and API server...")
 # ========== CONFIGURATION ==========
 DISCORD_BOT_TOKEN = os.getenv('DISCORD_BOT_TOKEN')
 
-# Debug: Check if token is set
 if not DISCORD_BOT_TOKEN:
     print("❌ CRITICAL: DISCORD_BOT_TOKEN environment variable is not set!")
     exit(1)
@@ -34,11 +33,9 @@ print("✅ Environment variables loaded successfully")
 PORT = int(os.getenv('PORT', 5000))
 RAILWAY_PUBLIC_URL = os.getenv('RAILWAY_STATIC_URL')
 
-# Use Railway's internal URL for API calls
 if RAILWAY_PUBLIC_URL:
     API_URL = f"https://{RAILWAY_PUBLIC_URL}"
 else:
-    # Fallback for local development
     API_URL = f"http://localhost:{PORT}"
 
 print(f"🌐 Public URL: {RAILWAY_PUBLIC_URL}")
@@ -226,6 +223,172 @@ def verify_payment():
         print(f"❌ Payment verification failed: {str(e)}")
         return jsonify({"status": "error", "message": str(e)}), 500
 
+@flask_app.route('/find_order_by_amount', methods=['POST'])
+def find_order_by_amount():
+    """Alternative endpoint for Minecraft mod to find orders by amount"""
+    try:
+        data = request.get_json()
+        print(f"🔍 Received find_order request: {data}")
+        
+        if not data:
+            return jsonify({"status": "error", "message": "No JSON data received"}), 400
+
+        required = ['amount']
+        if not all(field in data for field in required):
+            return jsonify({"status": "error", "message": "Missing amount field"}), 400
+
+        amount = data['amount']
+        orders = load_orders()
+        
+        # Find pending orders with this amount
+        matching_orders = []
+        for order_id, order in orders.items():
+            if (order.get("amount") == amount and 
+                order.get("status") == "pending" and
+                not order.get("is_code_redemption", False)):
+                matching_orders.append({
+                    "order_id": order_id,
+                    "discord_id": order.get("discord_id"),
+                    "plan": order.get("plan"),
+                    "days": order.get("days"),
+                    "created_at": order.get("created_at")
+                })
+        
+        print(f"🔍 Found {len(matching_orders)} matching orders for amount {amount}")
+        return jsonify({
+            "status": "success", 
+            "matches": matching_orders,
+            "count": len(matching_orders)
+        })
+        
+    except Exception as e:
+        print(f"❌ Find order failed: {str(e)}")
+        return jsonify({"status": "error", "message": str(e)}), 500
+
+@flask_app.route('/direct_payment', methods=['POST'])
+def direct_payment():
+    """Direct payment endpoint that doesn't require pre-existing order"""
+    try:
+        data = request.get_json()
+        print(f"💰 Received direct_payment request: {data}")
+        
+        if not data:
+            return jsonify({"status": "error", "message": "No JSON data received"}), 400
+
+        required = ['minecraft_username', 'amount', 'recipient']
+        if not all(field in data for field in required):
+            error_msg = f"Missing required fields: {required}"
+            print(f"❌ {error_msg}")
+            return jsonify({"status": "error", "message": error_msg}), 400
+
+        # Create a new order for this payment
+        orders = load_orders()
+        order_id = f"direct_{datetime.now().strftime('%Y%m%d%H%M%S')}"
+        
+        # Try to find which plan this amount corresponds to
+        amount = data['amount']
+        plan = "Unknown"
+        days = 1
+        
+        # Define price ranges for plans
+        plan_ranges = {
+            "1d": (19_000_000, 20_000_000),
+            "7d": (49_000_000, 50_000_000), 
+            "30d": (119_000_000, 120_000_000),
+            "90d": (199_000_000, 200_000_000),
+            "AntiAfk-Script": (99_000_000, 100_000_000),
+            "Items-Script": (199_000_000, 200_000_000)
+        }
+        
+        for plan_name, (min_price, max_price) in plan_ranges.items():
+            if min_price <= amount <= max_price:
+                plan = plan_name
+                if plan_name == "1d":
+                    days = 1
+                elif plan_name == "7d":
+                    days = 7
+                elif plan_name == "30d":
+                    days = 30
+                elif plan_name == "90d":
+                    days = 90
+                elif plan_name == "AntiAfk-Script":
+                    days = "antiafk"
+                elif plan_name == "Items-Script":
+                    days = "items"
+                break
+        
+        # Create the order
+        orders[order_id] = {
+            "discord_id": "unknown",  # Will be filled by admin verification
+            "amount": amount,
+            "days": days,
+            "plan": plan,
+            "status": "paid",
+            "is_code_redemption": False,
+            "created_at": datetime.now().isoformat(),
+            "paid_at": datetime.now().isoformat(),
+            "minecraft_username": data["minecraft_username"],
+            "payment_details": data,
+            "needs_verification": True  # Flag that this needs manual verification
+        }
+        
+        save_orders(orders)
+        
+        print(f"💰 Direct payment recorded - Order: {order_id}, Player: {data['minecraft_username']}, Amount: {amount}, Plan: {plan}")
+        
+        # Send verification message to Discord (without Discord user mention)
+        asyncio.run_coroutine_threadsafe(
+            send_direct_payment_message(
+                data['minecraft_username'],
+                amount,
+                plan,
+                order_id
+            ),
+            bot.loop
+        )
+        
+        return jsonify({
+            "status": "success", 
+            "order_id": order_id,
+            "message": "Payment recorded, awaiting admin verification"
+        })
+        
+    except Exception as e:
+        print(f"❌ Direct payment failed: {str(e)}")
+        return jsonify({"status": "error", "message": str(e)}), 500
+
+async def send_direct_payment_message(minecraft_username, amount, plan, order_id):
+    """Send message for direct payments (without Discord user)"""
+    try:
+        channel = bot.get_channel(VERIFICATION_CHANNEL_ID)
+        if not channel:
+            print(f"Verification channel {VERIFICATION_CHANNEL_ID} not found")
+            return None
+
+        embed = discord.Embed(
+            title="💰 Direct Payment Received",
+            color=0x00FF00,
+            description="**⚡ Direct payment detected! React with ✅ to verify and assign role**",
+            timestamp=datetime.now(timezone.utc)
+        )
+        
+        embed.add_field(name="Minecraft Username", value=f"```{minecraft_username}```", inline=True)
+        embed.add_field(name="Amount", value=f"```{amount:,}```", inline=True)
+        embed.add_field(name="Detected Plan", value=f"```{plan}```", inline=True)
+        embed.add_field(name="Order ID", value=f"```{order_id}```", inline=False)
+        embed.add_field(name="Status", value="🟡 **Needs Manual Verification**", inline=False)
+        embed.add_field(name="Action Required", value="Please verify the payment and ask the user for their Discord ID to assign the role.", inline=False)
+        
+        message = await channel.send(embed=embed)
+        await message.add_reaction("✅")
+        
+        print(f"✅ Direct payment message sent for order {order_id}")
+        return message
+        
+    except Exception as e:
+        print(f"Error sending direct payment message: {e}")
+        return None
+
 @flask_app.route('/redeem_code', methods=['POST'])
 def redeem_code():
     try:
@@ -306,7 +469,6 @@ async def purchase(interaction: discord.Interaction, plan: Literal["1d", "7d", "
             "is_code_redemption": False
         }
         
-        # Use the Railway URL with proper scheme
         url = f"{API_URL}/create_order"
         print(f"📤 Purchase request to: {url}")
         print(f"📦 Payload: {payload}")
@@ -314,94 +476,13 @@ async def purchase(interaction: discord.Interaction, plan: Literal["1d", "7d", "
         headers = {'Content-Type': 'application/json'}
         
         try:
-            response = requests.post(
-                url, 
-                json=payload, 
-                headers=headers,
-                timeout=30  # Increased timeout
-            )
+            response = requests.post(url, json=payload, headers=headers, timeout=30)
             
             print(f"📥 Response status: {response.status_code}")
-            print(f"📥 Response text: {response.text}")
-            
-            if response.status_code == 502:
-                # If we get 502, try using internal communication
-                print("🔄 502 error detected, trying internal API call...")
-                try:
-                    # Direct internal call
-                    with flask_app.test_client() as client:
-                        internal_response = client.post('/create_order', json=payload)
-                        print(f"📥 Internal response status: {internal_response.status_code}")
-                        print(f"📥 Internal response data: {internal_response.get_data(as_text=True)}")
-                        
-                        if internal_response.status_code == 200:
-                            response_data = internal_response.get_json()
-                            if response_data.get("status") == "success":
-                                payment_message = (
-                                    f"💎 Инструкция по покупке:\n\n"
-                                    f"Отправьте `{amount:,}` игроку `{PAYMENT_TARGET}` на Анархии 602 (/an602)\n"
-                                    f"Команда: ```/pay {PAYMENT_TARGET} {amount}```\n\n"
-                                    f"После покупки ваш заказ передастся администрации!"
-                                )
-                                await interaction.followup.send(payment_message, ephemeral=True)
-                                return
-                
-                except Exception as internal_error:
-                    print(f"❌ Internal API call failed: {internal_error}")
             
             if response.status_code != 200:
-                print(f"❌ API Error: {response.status_code} - {response.text}")
                 # Fallback: create order locally
                 print("🔄 Falling back to local order creation...")
-                try:
-                    orders = load_orders()
-                    order_id = f"order_{datetime.now().strftime('%Y%m%d%H%M%S')}"
-                    
-                    orders[order_id] = {
-                        **payload,
-                        "status": "pending",
-                        "created_at": datetime.now().isoformat()
-                    }
-                    
-                    save_orders(orders)
-                    
-                    payment_message = (
-                        f"💎 Инструкция по покупке:\n\n"
-                        f"Отправьте `{amount:,}` игроку `{PAYMENT_TARGET}` на Анархии 602 (/an602)\n"
-                        f"Команда: ```/pay {PAYMENT_TARGET} {amount}```\n\n"
-                        f"После покупки ваш заказ передастся администрации!"
-                    )
-                    
-                    await interaction.followup.send(payment_message, ephemeral=True)
-                    return
-                    
-                except Exception as fallback_error:
-                    print(f"❌ Fallback also failed: {fallback_error}")
-                    await interaction.followup.send("❌ Server temporarily unavailable. Please try again in a few moments.", ephemeral=True)
-                    return
-                
-            response_data = response.json()
-            print(f"✅ API Response: {response_data}")
-            
-            if response_data.get("status") != "success":
-                error_msg = response_data.get('message', 'Unknown error')
-                print(f"❌ API returned error: {error_msg}")
-                await interaction.followup.send(f"❌ Error: {error_msg}", ephemeral=True)
-                return
-            
-            payment_message = (
-                f"💎 Инструкция по покупке:\n\n"
-                f"Отправьте `{amount:,}` игроку `{PAYMENT_TARGET}` на Анархии 602 (/an602)\n"
-                f"Команда: ```/pay {PAYMENT_TARGET} {amount}```\n\n"
-                f"После покупки ваш заказ передастся администрации!"
-            )
-            
-            await interaction.followup.send(payment_message, ephemeral=True)
-            
-        except requests.exceptions.ConnectionError as e:
-            print(f"❌ Connection error: {e}")
-            # Fallback to local order creation
-            try:
                 orders = load_orders()
                 order_id = f"order_{datetime.now().strftime('%Y%m%d%H%M%S')}"
                 
@@ -421,22 +502,52 @@ async def purchase(interaction: discord.Interaction, plan: Literal["1d", "7d", "
                 )
                 
                 await interaction.followup.send(payment_message, ephemeral=True)
-            except Exception as fallback_error:
-                print(f"❌ Fallback failed: {fallback_error}")
-                await interaction.followup.send("❌ Cannot connect to server. Please try again later.", ephemeral=True)
-        except requests.exceptions.Timeout as e:
-            print(f"❌ Timeout error: {e}")
-            await interaction.followup.send("❌ Server timeout. Please try again.", ephemeral=True)
+                return
+                
+            response_data = response.json()
+            
+            if response_data.get("status") != "success":
+                error_msg = response_data.get('message', 'Unknown error')
+                await interaction.followup.send(f"❌ Error: {error_msg}", ephemeral=True)
+                return
+            
+            payment_message = (
+                f"💎 Инструкция по покупке:\n\n"
+                f"Отправьте `{amount:,}` игроку `{PAYMENT_TARGET}` на Анархии 602 (/an602)\n"
+                f"Команда: ```/pay {PAYMENT_TARGET} {amount}```\n\n"
+                f"После покупки ваш заказ передастся администрации!"
+            )
+            
+            await interaction.followup.send(payment_message, ephemeral=True)
+            
         except requests.exceptions.RequestException as e:
             print(f"❌ Request error: {e}")
-            await interaction.followup.send("❌ Network error. Please try again.", ephemeral=True)
+            # Fallback to local order creation
+            orders = load_orders()
+            order_id = f"order_{datetime.now().strftime('%Y%m%d%H%M%S')}"
+            
+            orders[order_id] = {
+                **payload,
+                "status": "pending",
+                "created_at": datetime.now().isoformat()
+            }
+            
+            save_orders(orders)
+            
+            payment_message = (
+                f"💎 Инструкция по покупке:\n\n"
+                f"Отправьте `{amount:,}` игроку `{PAYMENT_TARGET}` на Анархии 602 (/an602)\n"
+                f"Команда: ```/pay {PAYMENT_TARGET} {amount}```\n\n"
+                f"После покупки ваш заказ передастся администрации!"
+            )
+            
+            await interaction.followup.send(payment_message, ephemeral=True)
         
     except Exception as e:
         print(f"❌ Purchase command error: {type(e).__name__}: {e}")
         await interaction.followup.send("❌ Error processing purchase", ephemeral=True)
 
-# Add other commands (redeem, generate_codes, check_codes) here...
-# [Include all the other commands from the previous version: redeem, generate_codes, check_codes, on_raw_reaction_add, verify_order_from_reaction]
+# [Include other commands: redeem, generate_codes, check_codes, on_raw_reaction_add, verify_order_from_reaction]
 
 @bot.tree.command(name="redeem", description="Redeem a premium code")
 async def redeem(interaction: discord.Interaction, code: str):
@@ -459,28 +570,10 @@ async def redeem(interaction: discord.Interaction, code: str):
             "days": code_data["days"]
         }
         
-        headers = {'Content-Type': 'application/json'}
-        
         try:
-            response = requests.post(
-                f"{API_URL}/redeem_code",
-                json=payload,
-                headers=headers,
-                timeout=30
-            )
-            
+            response = requests.post(f"{API_URL}/redeem_code", json=payload, timeout=30)
             if response.status_code != 200:
-                # Fallback to local processing
-                raise Exception("API unavailable, using fallback")
-                
-            response_data = response.json()
-            if response_data.get("status") != "success":
-                await interaction.followup.send(
-                    f"❌ Error: {response_data.get('message', 'Unknown error')}",
-                    ephemeral=True
-                )
-                return
-                
+                raise Exception("API unavailable")
         except:
             # Local processing fallback
             codes_data = load_codes()
@@ -515,7 +608,6 @@ async def redeem(interaction: discord.Interaction, code: str):
             save_orders(orders)
             save_codes(codes_data)
             
-        # Update the original code data for role assignment
         code_data["redeemed"] = True
         code_data["redeemed_by"] = str(interaction.user.id)
         code_data["redeemed_at"] = datetime.utcnow().isoformat()
@@ -676,7 +768,12 @@ async def on_raw_reaction_add(payload):
             return
             
         embed = message.embeds[0]
-        if "Payment Verification Required" not in embed.title:
+        
+        # Handle both regular and direct payment embeds
+        is_payment_embed = ("Payment Verification Required" in embed.title or 
+                           "Direct Payment Received" in embed.title)
+        
+        if not is_payment_embed:
             return
         
         order_id = None
@@ -698,55 +795,66 @@ async def verify_order_from_reaction(order_id, admin_id, message):
     try:
         embed = message.embeds[0]
         discord_id = None
+        minecraft_username = None
         plan = None
         amount = None
         
         for field in embed.fields:
             if field.name == "Discord User":
                 discord_id = field.value.replace('<@', '').replace('>', '').strip()
+            elif field.name == "Minecraft Username":
+                minecraft_username = field.value.strip('`')
             elif field.name == "Plan":
                 plan = field.value.strip('`')
             elif field.name == "Amount":
                 amount = field.value.strip('`').replace(',', '')
         
-        if not discord_id:
-            print("❌ Could not extract Discord ID from embed")
-            return
+        # Update order status
+        orders = load_orders()
+        if order_id in orders:
+            orders[order_id]["status"] = "verified"
+            orders[order_id]["verified_at"] = datetime.now().isoformat()
+            orders[order_id]["verified_by"] = str(admin_id)
             
-        guild = bot.get_guild(GUILD_ID)
-        if not guild:
-            print(f"Guild {GUILD_ID} not found")
-            return
+            # If this was a direct payment, we might not have a Discord ID yet
+            if not discord_id and "discord_id" in orders[order_id] and orders[order_id]["discord_id"] != "unknown":
+                discord_id = orders[order_id]["discord_id"]
             
-        member = guild.get_member(int(discord_id))
-        if member:
-            role = guild.get_role(PREMIUM_ROLE_ID)
-            if role:
-                await member.add_roles(role)
-                print(f"✅ Role {PREMIUM_ROLE_ID} assigned to {member.display_name}")
-                
-                try:
-                    admin_user = await bot.fetch_user(admin_id)
-                    dm_message = (
-                        f"🎉 Ваша покупка подтверждена! Вы получили доступ к конфигурациям.\n\n"
-                        f"**Детали заказа:**\n"
-                        f"• План: {plan}\n"
-                        f"• Сумма: {int(amount):,}\n"
-                        f"• Подтверждено: {admin_user.display_name}\n\n"
-                        f"Если не загружается кфг - при входе в майн копируется хвид (если не копируется то используйте https://discord.com/channels/1288902708777979904/1424880610324910121)\n"
-                        f"В канале авторизации пиши `/register + хвид`\n"
-                        f"**ПРИМЕР КОМАНДЫ ДЛЯ АВТОРИЗАЦИИ:** `/register hwid: 731106141075386bfac06e0f2ab053be`\n"
-                        f"Канал находится в дискорд сервере невера. После авторизации перезапусти майн!"
-                    )
-                    
-                    dm_channel = await member.create_dm()
-                    await dm_channel.send(dm_message)
-                    print(f"✅ DM sent to {member.display_name}")
-                    
-                except discord.Forbidden:
-                    print(f"❌ Cannot send DM to {member.display_name} (DMs disabled)")
-                except Exception as e:
-                    print(f"❌ Error sending DM: {e}")
+            save_orders(orders)
+        
+        # Assign role if we have Discord ID
+        if discord_id and discord_id != "unknown":
+            guild = bot.get_guild(GUILD_ID)
+            if guild:
+                member = guild.get_member(int(discord_id))
+                if member:
+                    role = guild.get_role(PREMIUM_ROLE_ID)
+                    if role:
+                        await member.add_roles(role)
+                        print(f"✅ Role {PREMIUM_ROLE_ID} assigned to {member.display_name}")
+                        
+                        try:
+                            admin_user = await bot.fetch_user(admin_id)
+                            dm_message = (
+                                f"🎉 Ваша покупка подтверждена! Вы получили доступ к конфигурациям.\n\n"
+                                f"**Детали заказа:**\n"
+                                f"• План: {plan}\n"
+                                f"• Сумма: {int(amount):,}\n"
+                                f"• Подтверждено: {admin_user.display_name}\n\n"
+                                f"Если не загружается кфг - при входе в майн копируется хвид (если не копируется то используйте https://discord.com/channels/1288902708777979904/1424880610324910121)\n"
+                                f"В канале авторизации пиши `/register + хвид`\n"
+                                f"**ПРИМЕР КОМАНДЫ ДЛЯ АВТОРИЗАЦИИ:** `/register hwid: 731106141075386bfac06e0f2ab053be`\n"
+                                f"Канал находится в дискорд сервере невера. После авторизации перезапусти майн!"
+                            )
+                            
+                            dm_channel = await member.create_dm()
+                            await dm_channel.send(dm_message)
+                            print(f"✅ DM sent to {member.display_name}")
+                            
+                        except discord.Forbidden:
+                            print(f"❌ Cannot send DM to {member.display_name} (DMs disabled)")
+                        except Exception as e:
+                            print(f"❌ Error sending DM: {e}")
         
         embed.title = "✅ Payment Verified"
         embed.color = discord.Color.green()
